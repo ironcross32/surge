@@ -1,0 +1,101 @@
+The doc is a solid foundation — the keyboard model is well thought through. Comparing it against what the code        
+  actually does, here are the gaps and edge cases I'd resolve before planning. I've grouped them by how load-bearing    
+  they are.                                                                                                             
+                                                                                                                        
+  Conceptual gaps in the model                                                                                          
+                                                                                                                        
+  Nodes vs. segments — the counting is off by one and the doc conflates them. The storage is a list of segments; a      
+  "node" is the boundary between two segments. N segments have N+1 nodes, and the final node is a special case (it      
+  stores its own value nv1, while every other node's value belongs to the segment it starts). Several doc items need    
+  disambiguation once you adopt this: Home/End says "first or last node in a segment" — a segment only has two nodes, so
+  I suspect you meant first/last node of the whole MSEG, which then collides with Ctrl+Home/End "first or last segment" 
+  (the first node of the first segment is the start of the MSEG). Also, the context menu and most operations (type,     
+  duration, triggers, deform) are per-segment, not per-node, so "context menu on a node" needs a rule for which segment 
+  it targets (convention in the mouse UI: node i starts segment i).                                                     
+                                                                                                                        
+  Control points are entirely missing. Every non-Hold segment has a curve-shaping control point; for Bezier and Brownian
+  it's two-dimensional (X and Y). Mouse users drag these constantly — it's how you bend a linear segment or shape an    
+  S-curve. The keyboard model has no way to select or nudge one, and no equivalent of double-click-to-reset. The context
+  menu type-ins cover exact entry, but you'll want nudge access too (e.g., a modifier or a cursor mode that targets the 
+  current segment's CP).                                                                                                
+                                                                                                                        
+  The last node is special in three ways the doc should account for: (1) in "Link Start and End Nodes" mode, editing it 
+  actually edits node 0 — the announcement should say so; (2) in LFO edit mode its time is fixed and it can't be        
+  deleted; (3) in Envelope mode, X-nudging it extends the total duration rather than moving between neighbors.          
+                                                                                                                        
+  Operation edge cases                                                                                                  
+                                                                                                                        
+  - Adding a point needs a Y value. splitSegment(t, v) takes both a time and a value. When "A" is pressed with the      
+  cursor in empty space, the natural choice is the curve's value at that time (that's what the readout would show), but 
+  the doc doesn't say. Also: pressing A with the cursor exactly on an existing node should probably be rejected with an 
+  announcement rather than creating a zero-duration segment.                                                            
+  - "Unless no nodes exist" can't happen. The editor force-creates an init MSEG when n_activeSegments <= 0, so there is 
+  always at least one segment. Simplify that rule.                                                                      
+  - Shift+A (append) is Envelope-mode only. In LFO mode the MSEG is pinned to exactly one phase unit; extendTo past 1.0 
+  isn't allowed. Needs a "can't append in LFO mode" announcement.                                                       
+  - Hard limits to announce: 128 segments max (adds fail), and Delete is disallowed when only one segment remains (the  
+  mouse menu greys it out).                                                                                             
+  - X-nudge constraints are mode-dependent and can silently no-op. In Single mode a node is clamped between its         
+  neighbors and total duration is preserved; in Shift mode subsequent nodes slide along, capped by a max total duration 
+  (128 units). When a nudge hits a wall, the user should hear that nothing moved — the doc's "announce on cursor move"  
+  doesn't cover "the nudge was constrained/refused."                                                                    
+  - Y-nudge details: values clamp at ±1; when the LFO is set to unipolar the mouse UI doubles the vertical snap         
+  resolution — decide whether keyboard nudges respect that. And the doc announces on cursor movement but never says to  
+  announce the new value after a nudge, which is the more important feedback.                                           
+  - Cursor survival across structural changes. After add/delete, all segment indices shift; after context-menu actions  
+  like "Distribute Nodes Evenly", Create-menu templates (which replace the whole MSEG), Edit Mode switches, undo/redo,  
+  or a patch load while the overlay is open (forceRefresh), the cursor and any selection may point at nodes that no     
+  longer exist. Define: cursor follows time position, clamps to valid range, and re-announces.                          
+                                                                                                                        
+  Things the mouse can do that the doc doesn't map                                                                      
+                                                                                                                        
+  - Loop markers. The context menu's Set Loop Start/End covers most of it, but note these items only appear when Loop   
+  Mode ≠ Off and Edit Mode = Envelope — worth announcing why they're absent otherwise. There's no keyboard equivalent of
+  dragging a marker, which is probably fine, but say so deliberately.                                                   
+  - What a selection is for. The doc defines building a selection but not the operations on one. In the mouse UI, a     
+  lasso selection lets you (a) drag all selected nodes together and (b) apply a segment-type change to all selected     
+  segments. Presumably arrows/Alt+arrows and the context menu should operate on the whole selection when one exists —   
+  needs to be stated, including how announcements summarize a multi-node nudge.                                         
+  - Direct value type-in. The type-in editors (Duration, Value, CP) are reachable through the context menu and are      
+  already keyboard-friendly, but a direct shortcut on the focused node (F2-style "edit value") would save two levels of 
+  menu. Optional, but cheap since TypeinLambdaEditor exists and handles focus return.                                   
+  - Not worth mapping (but decide explicitly): pan/zoom, zoom lasso, freehand draw, and the temporary snap modifiers    
+  (Ctrl/Alt during drag) — your +/- step-size model replaces these. One consequence: keyboard operations should ignore  
+  the visual viewport entirely (a mouse user may have zoomed into a region; the keyboard cursor shouldn't be trapped by 
+  it).                                                                                                                  
+                                                                                                                        
+  Details that don't match the codebase                                                                                 
+                                                                                                                        
+  - "Musical notation selected in the bottom half" doesn't exist. The control strip has no time-notation option — just  
+  snap-grid divisions (1–32 per unit). Time is in abstract phase units (1.0 = one envelope unit; the actual musical     
+  duration depends on the LFO rate parameter). Either the step sizes should derive from the existing H-snap grid (which 
+  is the natural fit — it's what mouse snapping uses), or the doc is implicitly proposing a new notation setting, which 
+  is a bigger feature.                                                                                                  
+  - Announcement mechanism: patch/wavetable announcements go through SurgeGUIEditor::enqueueAccessibleAnnouncement,     
+  which posts through the JUCE accessibility API (i.e., your screen reader), gated by the "Send Additional Accessibility
+  Announcements" option — not SAPI/system voice. That's good news (your future "hidden control" experiment is roughly   
+  what it already does), but the doc should name this mechanism, and the new announcements probably need their own gate 
+  or reuse of the MSEG-editor option, since they'll be much chattier than patch announcements.                          
+  - The "several 0s" control in the lower half is almost certainly the two MultiSwitch widgets (Movement/Edit/Loop Mode)
+  exposing raw normalized values. Elsewhere in Surge, MultiSwitches are accessible — there's an established pattern     
+  (AccessibleHelpers.h, and the switches here even have setExplicitFocusOrder already). The fix is labeling/role work,  
+  not new architecture; the doc could reference the house pattern. Also the visual labels are free-floating juce::Labels
+  not associated with the controls, so the accessible titles must be set on the widgets themselves.                     
+  - Key conflicts to check: the standalone app's virtual-keyboard musical typing and Surge's global keyMapManager       
+  shortcuts both use bare letters; A/S/N and brackets may collide depending on focus. Right bracket is also             
+  AltGr-shifted on many non-US layouts. Surge has a key-binding manager and a keyboard-shortcuts toggle — worth deciding
+  whether the canvas keys are hardcoded (fine, since they only apply when the canvas has focus) or registered there.    
+  Shift+F10/Menu key is the natural context-menu trigger on Windows and JUCE doesn't do it for you automatically here.  
+  - Per-segment attributes for announcements — the full list worth speaking on node announcement or on demand: segment  
+  type, loop start/end membership, retrigger Filter/Amp EG flags, deform on/off/inverted, linked endpoints, and Hold    
+  segments having no control point. There's already an "Announce Editor State" keyboard action (ANNOUNCE_STATE) — an    
+  MSEG equivalent ("where am I, what's selected") would fit the house style.                                            
+  - Tear-out windows: the MSEG editor can be torn out into its own OS window; focus and key handling need to work in    
+  both states. Undo/redo should work for free if keyboard ops follow the existing prepareForUndo/pushToUndo pattern, but
+  that needs to be an explicit requirement.                                                                             
+                                                                                                                        
+  One piece of good news to fold into the doc: everything the keyboard model needs already exists as UI-independent     
+  functions in Surge::MSEG (splitSegment, deleteSegment, extendTo, adjustDuration*, setLoopStart/End, changeTypeAt,     
+  ...), so the accessible layer is a keyboard handler + cursor state + announcements over the same API the mouse uses — 
+  no engine changes required.                                                                                           
+ 

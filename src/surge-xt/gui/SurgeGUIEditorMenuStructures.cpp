@@ -1471,6 +1471,20 @@ juce::PopupMenu SurgeGUIEditor::makeAccesibilityMenu(const juce::Point<int> &rec
                     });
 #endif
 
+    bool doAccMSEG = Surge::Storage::getUserDefaultValue(
+        &(this->synth->storage), Surge::Storage::UseAccessibleMSEGEditor, false);
+
+    accMenu.addItem(
+        Surge::GUI::toOSCase("Accessible MSEG Editor"), true, doAccMSEG, [this, doAccMSEG]() {
+            Surge::Storage::updateUserDefaultValue(
+                &(this->synth->storage), Surge::Storage::UseAccessibleMSEGEditor, !doAccMSEG);
+
+            if (auto ol = getOverlayIfOpenAs<Surge::Overlays::MSEGEditor>(MSEG_EDITOR))
+            {
+                ol->forceRefresh();
+            }
+        });
+
     bool doExpMen = Surge::Storage::getUserDefaultValue(
         &(this->synth->storage), Surge::Storage::ExpandModMenusWithSubMenus, false);
 

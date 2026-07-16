@@ -21,7 +21,9 @@
  */
 
 #include "MSEGEditor.h"
+#include "MSEGEditorAccessibleKeyboard.h"
 #include "MSEGModulationHelper.h"
+#include "UserDefaults.h"
 #include "SurgeGUIUtils.h"
 #include "DebugHelpers.h"
 #include "SkinColors.h"
@@ -88,7 +90,10 @@ struct MSEGControlRegion : public juce::Component,
         setAccessible(true);
         setTitle("Controls");
         setDescription("Controls");
-        setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
+        // Accessibility grouping only. A keyboardFocusContainer here would wall the
+        // widgets off from the overlay's tab order while the region itself never
+        // takes focus, leaving them unreachable by tab.
+        setFocusContainerType(juce::Component::FocusContainerType::focusContainer);
         rebuild();
     };
 
@@ -148,6 +153,8 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
         setOpaque(true);
         setTitle("MSEG Display and Edit Canvas");
         setDescription("MSEG Display and Edit Canvas");
+        setAccessible(true);
+        refreshAccessibilityState();
     };
 
     enum SegmentProps
@@ -1700,6 +1707,29 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
                 g.drawText(txt2, readout, juce::Justification::centredLeft);
             }
         }
+
+        paintKeyboardCursor(g);
+    }
+
+    void paintKeyboardCursor(juce::Graphics &g)
+    {
+        if (!kbdHandler || !hasKeyboardFocus(false))
+            return;
+
+        const float handleRadius = 6.5f; // matches recalcHotZones
+        auto valpx = valToPx();
+        auto tpx = timeToPx();
+        auto pos = kbdHandler->cursorPosition();
+        auto cx = tpx(pos.first);
+        auto cy = valpx(pos.second);
+
+        g.setColour(skin->getColor(Colors::MSEGEditor::CurveHighlight));
+        g.drawEllipse(cx - handleRadius - 2, cy - handleRadius - 2, 2 * (handleRadius + 2),
+                      2 * (handleRadius + 2), 2.f);
+
+        // the free Y cursor, where A / Shift+A will place a new node
+        auto yy = valpx(kbdHandler->cursorY);
+        g.drawLine(cx - handleRadius - 6, yy, cx + handleRadius + 6, yy, 1.f);
     }
 
     juce::Point<int> mouseDownOrigin, lastPanZoomMousePos, cursorHideOrigin;
@@ -3417,6 +3447,12 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
         }
         this->sge->forceLfoDisplayRepaint();
         onModelChanged();
+
+        if (kbdHandler)
+        {
+            kbdHandler->revalidateCursor(!kbdHandler->inFlightEdit);
+        }
+
         repaint();
     }
 
@@ -3549,6 +3585,148 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
         {
             pushToUndo();
         }
+    }
+
+    /*
+     * The accessible keyboard model: when the Accessible MSEG Editor option is on,
+     * the canvas takes keyboard focus and forwards keys to a handler which edits
+     * the storage through the same Surge::MSEG API the mouse uses.
+     */
+    std::unique_ptr<MSEGAccessibleKeyboardHandler> kbdHandler;
+
+    bool accessibleKeyboardMode() const
+    {
+        return storage && Surge::Storage::getUserDefaultValue(
+                              storage, Surge::Storage::UseAccessibleMSEGEditor, false);
+    }
+
+    void refreshAccessibilityState()
+    {
+        auto en = accessibleKeyboardMode();
+
+        setWantsKeyboardFocus(en);
+
+        if (!en)
+        {
+            kbdHandler.reset();
+            return;
+        }
+
+        if (kbdHandler)
+        {
+            return;
+        }
+
+        kbdHandler = std::make_unique<MSEGAccessibleKeyboardHandler>();
+        kbdHandler->storage = storage;
+        kbdHandler->ms = ms;
+        kbdHandler->lfodata = lfodata;
+
+        auto &cbk = kbdHandler->cb;
+
+        cbk.announce = [this](const std::string &s) {
+            if (sge)
+                sge->enqueueImmediateAccessibleAnnouncement(s);
+        };
+        cbk.prepareForUndo = [this]() { prepareForUndo(); };
+        cbk.pushToUndo = [this]() { pushToUndo(); };
+        cbk.pushToUndoIfDirty = [this]() { pushToUndoIfDirty(); };
+        cbk.modelChanged = [this](int seg) { modelChanged(seg, false); };
+        cbk.openContextMenuForSegment = [this](int seg) {
+            hoveredSegment = seg;
+            auto pos = kbdHandler->cursorPosition();
+            openPopup(juce::Point<float>(timeToPx()(pos.first), valToPx()(pos.second)));
+        };
+        cbk.showTypein = [this](int seg, int prop) {
+            auto pos = kbdHandler->cursorPosition();
+            auto at = juce::Point<int>((int)timeToPx()(pos.first), (int)valToPx()(pos.second));
+
+            if (prop < 0)
+            {
+                // 2D control point: let the user pick which axis to type in
+                auto m = juce::PopupMenu();
+                m.addItem("Control Point X", [this, seg, at]() {
+                    showSegmentTypein(seg, SegmentProps::cp_duration, at);
+                });
+                m.addItem("Control Point Y", [this, seg, at]() {
+                    showSegmentTypein(seg, SegmentProps::cp_value, at);
+                });
+                m.showMenuAsync(sge->popupMenuOptions());
+            }
+            else
+            {
+                showSegmentTypein(seg, (SegmentProps)prop, at);
+            }
+        };
+        cbk.getTimeEditMode = [this]() { return (int)timeEditMode; };
+        cbk.getSelection = [this]() {
+            std::vector<int> r;
+            if (lassoSelector)
+            {
+                for (auto i : lassoSelector->items)
+                {
+                    r.push_back(i);
+                }
+            }
+            return r;
+        };
+        cbk.setSelection = [this](const std::vector<int> &sel) {
+            if (!lassoSelector)
+            {
+                lassoSelector = std::make_unique<MSEGLassoSelector>(this);
+            }
+            lassoSelector->items.deselectAll();
+            for (auto i : sel)
+            {
+                lassoSelector->items.addToSelection(i);
+            }
+            repaint();
+        };
+        cbk.repaint = [this]() { repaint(); };
+    }
+
+    bool keyPressed(const juce::KeyPress &key) override
+    {
+        if (kbdHandler && hasKeyboardFocus(false))
+        {
+            return kbdHandler->processKey(key);
+        }
+        return false;
+    }
+
+    void focusGained(juce::Component::FocusChangeType cause) override
+    {
+        if (kbdHandler)
+        {
+            kbdHandler->revalidateCursor(false);
+            kbdHandler->announceFocus();
+            repaint();
+        }
+    }
+
+    void focusLost(juce::Component::FocusChangeType cause) override
+    {
+        if (kbdHandler)
+        {
+            kbdHandler->cancelModes();
+            repaint();
+        }
+    }
+
+    std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+    {
+        return std::make_unique<juce::AccessibilityHandler>(
+            *this, juce::AccessibilityRole::group,
+            juce::AccessibilityActions().addAction(
+                juce::AccessibilityActionType::showMenu, [this]() {
+                    if (kbdHandler)
+                    {
+                        auto seg = kbdHandler->segmentForCursor();
+                        hoveredSegment = seg;
+                        auto pos = kbdHandler->cursorPosition();
+                        openPopup(juce::Point<float>(timeToPx()(pos.first), valToPx()(pos.second)));
+                    }
+                }));
     }
 };
 
@@ -3938,8 +4116,12 @@ void MSEGControlRegion::rebuild()
         {
             movementMode->setValue(eds->timeEditMode / 2.f);
         }
+        movementMode->setTitle("Movement Mode");
+        movementMode->setDescription("Movement Mode");
+        movementMode->setAccessibleCellLabels({"Single", "Shift", "Draw"});
         movementMode->setExplicitFocusOrder(10);
         addAndMakeVisible(*movementMode);
+        movementMode->setupAccessibility();
         // this value centers the loop mode and snap sections against the MSEG editor width
         // if more controls are to be added to that center section, reduce this value
         xpos += 173;
@@ -3981,8 +4163,12 @@ void MSEGControlRegion::rebuild()
         editMode->setHoverOnSwitchDrawable(std::get<2>(dbl));
 
         editMode->setValue(ms->editMode);
+        editMode->setTitle("Edit Mode");
+        editMode->setDescription("Edit Mode");
+        editMode->setAccessibleCellLabels({"Envelope", "LFO"});
         editMode->setExplicitFocusOrder(20);
         addAndMakeVisible(*editMode);
+        editMode->setupAccessibility();
 
         xpos += segWidth;
     }
@@ -4022,8 +4208,12 @@ void MSEGControlRegion::rebuild()
         loopMode->setHoverOnSwitchDrawable(std::get<2>(dbl));
 
         loopMode->setValue((ms->loopMode - 1) / 2.f);
+        loopMode->setTitle("Loop Mode");
+        loopMode->setDescription("Loop Mode");
+        loopMode->setAccessibleCellLabels({"Off", "Loop", "Gated Loop"});
         loopMode->setExplicitFocusOrder(30);
         addAndMakeVisible(*loopMode);
+        loopMode->setupAccessibility();
 
         xpos += segWidth;
     }
@@ -4059,6 +4249,8 @@ void MSEGControlRegion::rebuild()
             nullptr, dynamic_cast<SurgeImage *>(hsbmp), associatedBitmapStore,
             Surge::GUI::Skin::HoverType::HOVER);
         hSnapButton->setHoverSwitchDrawable(hoverBmp);
+        hSnapButton->setTitle("Horizontal Snap");
+        hSnapButton->setDescription("Horizontal Snap");
         hSnapButton->setExplicitFocusOrder(40);
         addAndMakeVisible(*hSnapButton);
 
@@ -4086,6 +4278,8 @@ void MSEGControlRegion::rebuild()
             }
             return false;
         };
+        hSnapSize->setTitle("Horizontal Snap Grid");
+        hSnapSize->setDescription("Horizontal Snap Grid, divisions per unit");
         hSnapSize->setExplicitFocusOrder(50);
         addAndMakeVisible(*hSnapSize);
 
@@ -4103,6 +4297,8 @@ void MSEGControlRegion::rebuild()
         hoverBmp = skin->hoverBitmapOverlayForBackgroundBitmap(
             nullptr, vsbmp, associatedBitmapStore, Surge::GUI::Skin::HoverType::HOVER);
         vSnapButton->setHoverSwitchDrawable(hoverBmp);
+        vSnapButton->setTitle("Vertical Snap");
+        vSnapButton->setDescription("Vertical Snap");
         vSnapButton->setExplicitFocusOrder(60);
         addAndMakeVisible(*vSnapButton);
 
@@ -4130,6 +4326,8 @@ void MSEGControlRegion::rebuild()
             }
             return false;
         };
+        vSnapSize->setTitle("Vertical Snap Grid");
+        vSnapSize->setDescription("Vertical Snap Grid, divisions per unit");
         vSnapSize->setExplicitFocusOrder(70);
         addAndMakeVisible(*vSnapSize);
     }
@@ -4168,7 +4366,10 @@ void MSEGEditor::forceRefresh()
     {
         auto ed = dynamic_cast<MSEGCanvas *>(kid);
         if (ed)
+        {
+            ed->refreshAccessibilityState();
             ed->modelChanged();
+        }
         auto cr = dynamic_cast<MSEGControlRegion *>(kid);
         if (cr)
             cr->rebuild();
