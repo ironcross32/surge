@@ -1165,8 +1165,7 @@ bool MSEGAccessibleKeyboardHandler::processSelectionKey(const juce::KeyPress &ke
     auto kc = key.getKeyCode();
     auto N = selectableNodeCount();
 
-    if (kc == juce::KeyPress::returnKey || kc == juce::KeyPress::escapeKey ||
-        altLetter(key) == 's')
+    if (kc == juce::KeyPress::returnKey || kc == juce::KeyPress::escapeKey || altLetter(key) == 's')
     {
         exitSelection();
         return true;
@@ -1195,8 +1194,7 @@ bool MSEGAccessibleKeyboardHandler::processSelectionKey(const juce::KeyPress &ke
         {
             auto nSel = std::abs(index - selectionAnchor) + 1;
             if (growing)
-                cb.announce(
-                    fmt::format("Node {} selected, {} nodes selected", index + 1, nSel));
+                cb.announce(fmt::format("Node {} selected, {} nodes selected", index + 1, nSel));
             else
                 cb.announce(
                     fmt::format("Node {} unselected, {} nodes selected", unselected + 1, nSel));
