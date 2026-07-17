@@ -349,9 +349,6 @@ std::string defaultKeyToString(DefaultKey k)
     case UseNarratorAnnouncementsForPatchTypeahead:
         r = "useNarratorAnnouncementsForPatchTypeahead";
         break;
-    case UseAccessibleMSEGEditor:
-        r = "useAccessibleMSEGEditor";
-        break;
 
     case FXUnitAssumeFixedBlock:
         r = "fxAssumeFixedBlock";

@@ -3233,15 +3233,6 @@ void SurgeGUIEditor::setRecommendedAccessibility()
         &(this->synth->storage), Surge::Storage::FocusModEditorAfterAddModulationFrom, true);
     oss << "Expanded Modulation Menus and Modulation Focus; ";
 
-    Surge::Storage::updateUserDefaultValue(&(this->synth->storage),
-                                           Surge::Storage::UseAccessibleMSEGEditor, true);
-    oss << "Accessible MSEG editor on; ";
-
-    if (auto ol = getOverlayIfOpenAs<Surge::Overlays::MSEGEditor>(MSEG_EDITOR))
-    {
-        ol->forceRefresh();
-    }
-
     // Accessibility relies on Surge moving keyboard focus, so make sure the
     // "never move keyboard focus" preference is off.
     Surge::Storage::updateUserDefaultValue(&(this->synth->storage),

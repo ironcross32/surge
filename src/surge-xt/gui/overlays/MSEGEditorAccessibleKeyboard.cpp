@@ -99,6 +99,14 @@ char lowerChar(const juce::KeyPress &key)
     return 0;
 }
 
+// letter shortcuts require ALT (Option on mac) so bare letters never trigger actions
+char altLetter(const juce::KeyPress &key)
+{
+    if (!key.getModifiers().isAltDown())
+        return 0;
+    return lowerChar(key);
+}
+
 float quantizeValue(float v, float snapResolution)
 {
     if (snapResolution > 0)
@@ -139,29 +147,13 @@ bool MSEGAccessibleKeyboardHandler::controlPointIs2D(int seg) const
     return t == MSEGStorage::segment::QUAD_BEZIER || t == MSEGStorage::segment::BROWNIAN;
 }
 
-float MSEGAccessibleKeyboardHandler::controlPointTime(int seg) const
-{
-    auto &s = ms->segments[seg];
-    auto frac = controlPointIs2D(seg) ? s.cpduration : 0.5f;
-    return ms->segmentStart[seg] + frac * s.duration;
-}
-
-float MSEGAccessibleKeyboardHandler::controlPointValue(int seg) const
-{
-    return ms->segments[seg].cpv;
-}
-
 std::pair<float, float> MSEGAccessibleKeyboardHandler::cursorPosition() const
 {
-    if (part == Part::CONTROL_POINT)
-        return {controlPointTime(index), controlPointValue(index)};
     return {nodeTime(index), nodeValue(index)};
 }
 
 int MSEGAccessibleKeyboardHandler::segmentForCursor() const
 {
-    if (part == Part::CONTROL_POINT)
-        return index;
     return std::min(index, ms->n_activeSegments - 1);
 }
 
@@ -205,6 +197,14 @@ float MSEGAccessibleKeyboardHandler::xSnapFor(const juce::ModifierKeys &mods) co
 float MSEGAccessibleKeyboardHandler::ySnapFor(const juce::ModifierKeys &mods) const
 {
     return mods.isShiftDown() ? 0.f : ms->vSnap * unipolarFactor();
+}
+
+float MSEGAccessibleKeyboardHandler::curveValueAt(float t) const
+{
+    Surge::MSEG::EvaluatorState es;
+    auto iup = (int)t;
+    auto fup = t - iup;
+    return Surge::MSEG::valueAt(iup, fup, 0.f, ms, &es, true);
 }
 
 std::string MSEGAccessibleKeyboardHandler::formatValue(float v) const
@@ -257,7 +257,7 @@ void MSEGAccessibleKeyboardHandler::announceCursor()
 {
     if (!cb.announce)
         return;
-    cb.announce(part == Part::NODE ? nodeAnnouncement(index) : cpAnnouncement(index));
+    cb.announce(nodeAnnouncement(index));
 }
 
 void MSEGAccessibleKeyboardHandler::announceFocus()
@@ -266,7 +266,7 @@ void MSEGAccessibleKeyboardHandler::announceFocus()
         return;
     auto s = fmt::format("MSEG canvas, {} segments, {} mode. ", ms->n_activeSegments,
                          ms->editMode == MSEGStorage::EditMode::LFO ? "LFO" : "envelope");
-    s += part == Part::NODE ? nodeAnnouncement(index) : cpAnnouncement(index);
+    s += nodeAnnouncement(index);
     cb.announce(s);
 }
 
@@ -275,93 +275,41 @@ void MSEGAccessibleKeyboardHandler::announceEditorState()
     if (!cb.announce)
         return;
 
-    std::string modeName;
-    switch (mode)
-    {
-    case Mode::CURSOR:
-        modeName = "Cursor";
-        break;
-    case Mode::MANIPULATE:
-        modeName = "Manipulation";
-        break;
-    case Mode::SELECTION:
-        modeName = "Selection";
-        break;
-    case Mode::GROUP_MANIPULATE:
-        modeName = "Group manipulation";
-        break;
-    }
+    std::string modeName = mode == Mode::SELECTION ? "Selection" : "Cursor";
 
     auto nSel = cb.getSelection ? (int)cb.getSelection().size() : 0;
     auto s = fmt::format("MSEG canvas, {} segments, {} mode, {} mode active, {} nodes selected. ",
                          ms->n_activeSegments,
                          ms->editMode == MSEGStorage::EditMode::LFO ? "LFO" : "envelope", modeName,
                          nSel);
-    s += part == Part::NODE ? nodeAnnouncement(index) : cpAnnouncement(index);
+    s += nodeAnnouncement(index);
+
+    auto seg = segmentForCursor();
+    if (controlPointUsable(seg))
+        s += ". " + cpAnnouncement(seg);
+
     cb.announce(s);
 }
 
 void MSEGAccessibleKeyboardHandler::placeCursorOnNode(int node)
 {
-    part = Part::NODE;
     index = std::clamp(node, 0, numNodes() - 1);
-    cursorY = nodeValue(index);
     rememberedTime = nodeTime(index);
     if (cb.repaint)
         cb.repaint();
 }
 
-void MSEGAccessibleKeyboardHandler::placeCursorOnControlPoint(int seg)
+// navigating in cursor mode abandons any selection
+void MSEGAccessibleKeyboardHandler::moveCursor(int direction)
 {
-    part = Part::CONTROL_POINT;
-    index = std::clamp(seg, 0, ms->n_activeSegments - 1);
-    rememberedTime = controlPointTime(index);
-    if (cb.repaint)
-        cb.repaint();
-}
+    auto pre = std::string(hasSelection() ? "Selection cleared. " : "");
+    if (!pre.empty())
+        clearSelection();
 
-void MSEGAccessibleKeyboardHandler::moveCursor(int direction, bool skipControlPoints)
-{
-    auto N = ms->n_activeSegments;
-
-    if (part == Part::NODE)
-    {
-        if (direction > 0)
-        {
-            if (index >= N)
-            {
-                if (cb.announce)
-                    cb.announce("Last node");
-                return;
-            }
-            if (!skipControlPoints && controlPointUsable(index))
-                placeCursorOnControlPoint(index);
-            else
-                placeCursorOnNode(index + 1);
-        }
-        else
-        {
-            if (index <= 0)
-            {
-                if (cb.announce)
-                    cb.announce("First node");
-                return;
-            }
-            if (!skipControlPoints && controlPointUsable(index - 1))
-                placeCursorOnControlPoint(index - 1);
-            else
-                placeCursorOnNode(index - 1);
-        }
-    }
-    else
-    {
-        if (direction > 0)
-            placeCursorOnNode(index + 1);
-        else
-            placeCursorOnNode(index);
-    }
-
-    announceCursor();
+    auto n = numNodes();
+    placeCursorOnNode(((index + direction) % n + n) % n);
+    if (cb.announce)
+        cb.announce(pre + nodeAnnouncement(index));
 }
 
 void MSEGAccessibleKeyboardHandler::nudgeNodeY(int node, float dy, float snapRes,
@@ -473,8 +421,6 @@ void MSEGAccessibleKeyboardHandler::nudgeControlPoint(int seg, float dx, float d
             cb.modelChanged(seg);
         inFlightEdit = false;
 
-        rememberedTime = controlPointTime(seg);
-
         if (cb.announce)
         {
             if (std::fabs(s.cpduration - before) > 1e-7)
@@ -531,7 +477,7 @@ void MSEGAccessibleKeyboardHandler::addNode(bool append)
 
         if (cb.prepareForUndo)
             cb.prepareForUndo();
-        Surge::MSEG::extendTo(ms, ms->totalDuration + step, cursorY);
+        Surge::MSEG::extendTo(ms, ms->totalDuration + step, ms->segments[N - 1].nv1);
         if (cb.pushToUndo)
             cb.pushToUndo();
 
@@ -560,7 +506,7 @@ void MSEGAccessibleKeyboardHandler::addNode(bool append)
 
         if (cb.prepareForUndo)
             cb.prepareForUndo();
-        Surge::MSEG::splitSegment(ms, t, cursorY);
+        Surge::MSEG::splitSegment(ms, t, curveValueAt(t));
         if (cb.pushToUndo)
             cb.pushToUndo();
 
@@ -579,12 +525,6 @@ void MSEGAccessibleKeyboardHandler::deleteNode(bool removeSegment)
 {
     auto N = ms->n_activeSegments;
 
-    if (part == Part::CONTROL_POINT)
-    {
-        if (cb.announce)
-            cb.announce("Control points cannot be deleted");
-        return;
-    }
     if (index <= 0)
     {
         if (cb.announce)
@@ -627,45 +567,33 @@ void MSEGAccessibleKeyboardHandler::deleteNode(bool removeSegment)
 
 void MSEGAccessibleKeyboardHandler::resetCP()
 {
-    if (part != Part::CONTROL_POINT)
+    auto seg = segmentForCursor();
+
+    if (!controlPointUsable(seg))
     {
         if (cb.announce)
-            cb.announce("Not on a control point");
+            cb.announce("No control point on this segment");
         return;
     }
 
     if (cb.prepareForUndo)
         cb.prepareForUndo();
-    Surge::MSEG::resetControlPoint(ms, index);
+    Surge::MSEG::resetControlPoint(ms, seg);
     if (cb.pushToUndo)
         cb.pushToUndo();
 
     inFlightEdit = true;
     if (cb.modelChanged)
-        cb.modelChanged(index);
+        cb.modelChanged(seg);
     inFlightEdit = false;
 
     if (cb.announce)
-        cb.announce("Control point reset. " + cpAnnouncement(index));
+        cb.announce("Control point reset. " + cpAnnouncement(seg));
 }
 
-void MSEGAccessibleKeyboardHandler::enterManipulate()
+bool MSEGAccessibleKeyboardHandler::hasSelection() const
 {
-    if (cb.prepareForUndo)
-        cb.prepareForUndo();
-    mode = Mode::MANIPULATE;
-    if (cb.announce)
-        cb.announce(std::string("Manipulation mode on. Arrow keys move the ") +
-                    (part == Part::NODE ? "node" : "control point"));
-}
-
-void MSEGAccessibleKeyboardHandler::exitManipulate(bool announce)
-{
-    if (cb.pushToUndoIfDirty)
-        cb.pushToUndoIfDirty();
-    mode = Mode::CURSOR;
-    if (announce && cb.announce)
-        cb.announce("Manipulation mode off");
+    return cb.getSelection && !cb.getSelection().empty();
 }
 
 void MSEGAccessibleKeyboardHandler::enterSelection()
@@ -673,56 +601,60 @@ void MSEGAccessibleKeyboardHandler::enterSelection()
     mode = Mode::SELECTION;
 
     // selection deals only in nodes 0 .. N-1, matching the mouse lasso
-    if (part == Part::CONTROL_POINT)
-        placeCursorOnNode(index);
-    else if (index >= selectableNodeCount())
+    if (index >= selectableNodeCount())
         placeCursorOnNode(selectableNodeCount() - 1);
 
-    auto nSel = cb.getSelection ? (int)cb.getSelection().size() : 0;
+    selectionAnchor = index;
+    if (cb.setSelection)
+        cb.setSelection({index});
     if (cb.announce)
-        cb.announce(fmt::format("Selection mode on, {} nodes selected", nSel));
+        cb.announce("Selection mode on, 1 node selected");
 }
 
-void MSEGAccessibleKeyboardHandler::exitSelection(bool clear)
+void MSEGAccessibleKeyboardHandler::exitSelection()
 {
-    if (clear && cb.setSelection)
+    mode = Mode::CURSOR;
+    if (cb.announce)
+    {
+        auto nSel = cb.getSelection ? (int)cb.getSelection().size() : 0;
+        cb.announce(fmt::format("Selection mode off, {} nodes selected", nSel));
+    }
+}
+
+void MSEGAccessibleKeyboardHandler::applyAnchorRange()
+{
+    if (!cb.setSelection)
+        return;
+
+    std::vector<int> sel;
+    for (int i = std::min(selectionAnchor, index); i <= std::max(selectionAnchor, index); ++i)
+        sel.push_back(i);
+    cb.setSelection(sel);
+}
+
+void MSEGAccessibleKeyboardHandler::clearSelection()
+{
+    if (cb.setSelection)
     {
         cb.setSelection({});
         if (cb.repaint)
             cb.repaint();
     }
-    mode = Mode::CURSOR;
-    if (cb.announce)
-        cb.announce(clear ? "Selection mode off, selection cleared" : "Selection mode off");
 }
 
-void MSEGAccessibleKeyboardHandler::enterGroup()
+void MSEGAccessibleKeyboardHandler::selectAll()
 {
-    auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
-    if (sel.empty())
-    {
-        if (cb.announce)
-            cb.announce("Nothing selected");
-        return;
-    }
-
-    if (cb.prepareForUndo)
-        cb.prepareForUndo();
-    mode = Mode::GROUP_MANIPULATE;
+    auto N = selectableNodeCount();
+    std::vector<int> all;
+    for (int i = 0; i < N; ++i)
+        all.push_back(i);
+    if (cb.setSelection)
+        cb.setSelection(all);
     if (cb.announce)
-        cb.announce(fmt::format("Group manipulation on, {} nodes", sel.size()));
+        cb.announce(fmt::format("All nodes selected, {} nodes", N));
 }
 
-void MSEGAccessibleKeyboardHandler::exitGroup(bool announce)
-{
-    if (cb.pushToUndoIfDirty)
-        cb.pushToUndoIfDirty();
-    mode = Mode::SELECTION;
-    if (announce && cb.announce)
-        cb.announce("Group manipulation off");
-}
-
-void MSEGAccessibleKeyboardHandler::groupNudgeY(float dy, float snapRes)
+bool MSEGAccessibleKeyboardHandler::groupNudgeY(float dy, float snapRes)
 {
     auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
     auto N = ms->n_activeSegments;
@@ -753,9 +685,11 @@ void MSEGAccessibleKeyboardHandler::groupNudgeY(float dy, float snapRes)
         else
             cb.announce("At limit");
     }
+
+    return changed;
 }
 
-void MSEGAccessibleKeyboardHandler::groupNudgeX(float dx, float snap)
+bool MSEGAccessibleKeyboardHandler::groupNudgeX(float dx, float snap)
 {
     auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
     auto N = ms->n_activeSegments;
@@ -813,17 +747,106 @@ void MSEGAccessibleKeyboardHandler::groupNudgeX(float dx, float snap)
         else
             cb.announce("Constrained, did not move");
     }
+
+    return changed;
 }
 
-void MSEGAccessibleKeyboardHandler::cancelModes()
+bool MSEGAccessibleKeyboardHandler::groupNudgeCP(float dx, float dy)
 {
-    if (mode == Mode::MANIPULATE || mode == Mode::GROUP_MANIPULATE)
+    auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
+    auto N = ms->n_activeSegments;
+    int usable = 0, moved = 0;
+
+    for (auto i : sel)
     {
-        if (cb.pushToUndoIfDirty)
-            cb.pushToUndoIfDirty();
+        if (i < 0 || i >= N || !controlPointUsable(i))
+            continue;
+        if (dx != 0 && !controlPointIs2D(i))
+            continue;
+
+        usable++;
+        auto &s = ms->segments[i];
+        auto beforeX = s.cpduration;
+        auto beforeY = s.cpv;
+
+        if (dx != 0)
+            s.cpduration += dx / std::max(s.duration, 0.001f);
+        if (dy != 0)
+            s.cpv = std::clamp(s.cpv + dy, -1.f, 1.f);
+        Surge::MSEG::constrainControlPointAt(ms, i);
+
+        if (std::fabs(s.cpduration - beforeX) > 1e-7 || std::fabs(s.cpv - beforeY) > 1e-7)
+            moved++;
     }
-    mode = Mode::CURSOR;
+
+    inFlightEdit = true;
+    if (cb.modelChanged)
+        cb.modelChanged(-1);
+    inFlightEdit = false;
+
+    if (cb.announce)
+    {
+        if (usable == 0)
+            cb.announce(dx != 0 ? "No horizontal control points in selection"
+                                : "No control points in selection");
+        else if (moved > 0)
+            cb.announce(fmt::format("{} control points moved", moved));
+        else
+            cb.announce("At limit");
+    }
+
+    return moved > 0;
 }
+
+void MSEGAccessibleKeyboardHandler::groupDelete(bool removeSegment)
+{
+    auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
+
+    // highest time first, so earlier node times stay valid as segments go away
+    std::sort(sel.begin(), sel.end(), std::greater<int>());
+
+    if (cb.prepareForUndo)
+        cb.prepareForUndo();
+
+    int deleted = 0;
+    for (auto i : sel)
+    {
+        if (i <= 0 || i >= ms->n_activeSegments)
+            continue;
+        if (ms->n_activeSegments <= 1)
+            break;
+
+        if (removeSegment)
+            Surge::MSEG::deleteSegment(ms, nodeTime(i));
+        else
+            Surge::MSEG::unsplitSegment(ms, nodeTime(i));
+        Surge::MSEG::rebuildCache(ms);
+        deleted++;
+    }
+
+    if (deleted == 0)
+    {
+        if (cb.announce)
+            cb.announce("Nothing deleted, start node cannot be deleted");
+        return;
+    }
+
+    if (cb.pushToUndo)
+        cb.pushToUndo();
+
+    clearSelection();
+
+    inFlightEdit = true;
+    if (cb.modelChanged)
+        cb.modelChanged(-1);
+    inFlightEdit = false;
+
+    placeCursorOnNode(std::min(index, numNodes() - 1));
+    if (cb.announce)
+        cb.announce(fmt::format("{} nodes deleted. ", deleted) + nodeAnnouncement(index));
+}
+
+void MSEGAccessibleKeyboardHandler::cancelModes() { mode = Mode::CURSOR; }
 
 void MSEGAccessibleKeyboardHandler::revalidateCursor(bool announceIfMoved)
 {
@@ -831,16 +854,9 @@ void MSEGAccessibleKeyboardHandler::revalidateCursor(bool announceIfMoved)
         return;
 
     auto N = ms->n_activeSegments;
-    auto oldPart = part;
     auto oldIndex = index;
 
-    if (part == Part::CONTROL_POINT && !controlPointUsable(index))
-    {
-        part = Part::NODE;
-        index = std::clamp(index, 0, N);
-    }
-
-    if (part == Part::NODE && index > N)
+    if (index > N)
     {
         // resolve to the node nearest where the cursor last was in time
         int best = 0;
@@ -867,18 +883,11 @@ void MSEGAccessibleKeyboardHandler::revalidateCursor(bool announceIfMoved)
 
         if (pruned.size() != sel.size())
             cb.setSelection(pruned);
-
-        if (mode == Mode::GROUP_MANIPULATE && pruned.empty())
-        {
-            exitGroup(false);
-            if (announceIfMoved && cb.announce)
-                cb.announce("Selection cleared, group manipulation off");
-        }
     }
 
-    rememberedTime = part == Part::NODE ? nodeTime(index) : controlPointTime(index);
+    rememberedTime = nodeTime(index);
 
-    if (part != oldPart || index != oldIndex)
+    if (index != oldIndex)
     {
         if (cb.repaint)
             cb.repaint();
@@ -895,69 +904,135 @@ bool MSEGAccessibleKeyboardHandler::processKey(const juce::KeyPress &key)
     // never operate on a stale cursor
     revalidateCursor(false);
 
-    switch (mode)
-    {
-    case Mode::CURSOR:
-        return processCursorKey(key);
-    case Mode::MANIPULATE:
-        return processManipulateKey(key);
-    case Mode::SELECTION:
+    if (mode == Mode::SELECTION)
         return processSelectionKey(key);
-    case Mode::GROUP_MANIPULATE:
-        return processGroupKey(key);
-    }
-
-    return false;
+    return processCursorKey(key);
 }
 
 bool MSEGAccessibleKeyboardHandler::processCursorKey(const juce::KeyPress &key)
 {
     auto mods = key.getModifiers();
     auto kc = key.getKeyCode();
-    auto c = lowerChar(key);
+    auto c = altLetter(key);
     auto N = ms->n_activeSegments;
+
+    if (kc == juce::KeyPress::tabKey)
+    {
+        moveCursor(mods.isShiftDown() ? -1 : 1);
+        return true;
+    }
 
     if (kc == juce::KeyPress::leftKey || kc == juce::KeyPress::rightKey)
     {
-        auto dir = kc == juce::KeyPress::rightKey ? 1 : -1;
+        auto dx = (kc == juce::KeyPress::rightKey ? 1.f : -1.f) * xStep(mods);
 
         if (mods.isAltDown())
         {
-            if (part == Part::CONTROL_POINT)
+            if (hasSelection())
+            {
+                if (cb.prepareForUndo)
+                    cb.prepareForUndo();
+                if (groupNudgeCP(dx, 0.f) && cb.pushToUndo)
+                    cb.pushToUndo();
+                return true;
+            }
+
+            auto seg = segmentForCursor();
+
+            if (!controlPointUsable(seg))
             {
                 if (cb.announce)
-                    cb.announce("Use manipulation mode to move control points");
+                    cb.announce("No control point on this segment");
                 return true;
             }
 
             if (cb.prepareForUndo)
                 cb.prepareForUndo();
-            auto before = nodeTime(index);
-            nudgeNodeX(index, dir * xStep(mods), xSnapFor(mods), true);
-            if (std::fabs(nodeTime(index) - before) > 1e-7 && cb.pushToUndo)
+            auto before = ms->segments[seg].cpduration;
+            nudgeControlPoint(seg, dx, 0.f);
+            if (std::fabs(ms->segments[seg].cpduration - before) > 1e-7 && cb.pushToUndo)
                 cb.pushToUndo();
             return true;
         }
 
-        moveCursor(dir, mods.isCommandDown());
+        if (hasSelection())
+        {
+            if (cb.prepareForUndo)
+                cb.prepareForUndo();
+            if (groupNudgeX(dx, xSnapFor(mods)) && cb.pushToUndo)
+                cb.pushToUndo();
+            return true;
+        }
+
+        if (cb.prepareForUndo)
+            cb.prepareForUndo();
+        auto before = nodeTime(index);
+        nudgeNodeX(index, dx, xSnapFor(mods), true);
+        if (std::fabs(nodeTime(index) - before) > 1e-7 && cb.pushToUndo)
+            cb.pushToUndo();
         return true;
     }
 
     if (kc == juce::KeyPress::upKey || kc == juce::KeyPress::downKey)
     {
-        auto d = (kc == juce::KeyPress::upKey ? 1.f : -1.f) * yStep(mods);
-        cursorY = std::clamp(cursorY + d, -1.f, 1.f);
-        if (cb.announce)
-            cb.announce("Cursor Y " + formatValue(cursorY));
-        if (cb.repaint)
-            cb.repaint();
+        auto dy = (kc == juce::KeyPress::upKey ? 1.f : -1.f) * yStep(mods);
+
+        if (mods.isAltDown())
+        {
+            if (hasSelection())
+            {
+                if (cb.prepareForUndo)
+                    cb.prepareForUndo();
+                if (groupNudgeCP(0.f, dy) && cb.pushToUndo)
+                    cb.pushToUndo();
+                return true;
+            }
+
+            auto seg = segmentForCursor();
+
+            if (!controlPointUsable(seg))
+            {
+                if (cb.announce)
+                    cb.announce("No control point on this segment");
+                return true;
+            }
+
+            if (cb.prepareForUndo)
+                cb.prepareForUndo();
+            auto before = ms->segments[seg].cpv;
+            nudgeControlPoint(seg, 0.f, dy);
+            if (std::fabs(ms->segments[seg].cpv - before) > 1e-7 && cb.pushToUndo)
+                cb.pushToUndo();
+            return true;
+        }
+
+        if (hasSelection())
+        {
+            if (cb.prepareForUndo)
+                cb.prepareForUndo();
+            if (groupNudgeY(dy, ySnapFor(mods)) && cb.pushToUndo)
+                cb.pushToUndo();
+            return true;
+        }
+
+        if (cb.prepareForUndo)
+            cb.prepareForUndo();
+        auto before = nodeValue(index);
+        nudgeNodeY(index, dy, ySnapFor(mods), true);
+        if (std::fabs(nodeValue(index) - before) > 1e-7 && cb.pushToUndo)
+            cb.pushToUndo();
         return true;
     }
 
     if (kc == juce::KeyPress::homeKey || kc == juce::KeyPress::endKey)
     {
+        auto pre = std::string(hasSelection() ? "Selection cleared. " : "");
+        if (!pre.empty())
+            clearSelection();
+
         placeCursorOnNode(kc == juce::KeyPress::homeKey ? 0 : numNodes() - 1);
-        announceCursor();
+        if (cb.announce)
+            cb.announce(pre + nodeAnnouncement(index));
         return true;
     }
 
@@ -979,50 +1054,61 @@ bool MSEGAccessibleKeyboardHandler::processCursorKey(const juce::KeyPress &key)
             return true;
         }
 
+        auto pre = std::string(hasSelection() ? "Selection cleared. " : "");
+        if (!pre.empty())
+            clearSelection();
+
         placeCursorOnNode(target);
-        announceCursor();
+        if (cb.announce)
+            cb.announce(pre + nodeAnnouncement(index));
         return true;
     }
 
     if (kc == juce::KeyPress::returnKey)
     {
-        if (mods.isCommandDown())
+        if (mods.isAltDown())
         {
-            if (part == Part::NODE)
+            auto seg = segmentForCursor();
+
+            if (!controlPointUsable(seg))
             {
-                if (index >= N)
-                {
-                    if (ms->endpointMode == MSEGStorage::EndpointMode::LOCKED)
-                    {
-                        if (cb.announce)
-                            cb.announce("Editing start node value, linked endpoints");
-                        if (cb.showTypein)
-                            cb.showTypein(0, kTypeinValue);
-                    }
-                    else if (cb.announce)
-                    {
-                        cb.announce("No type-in for the final node, use manipulation mode");
-                    }
-                }
-                else if (cb.showTypein)
-                {
-                    cb.showTypein(index, kTypeinValue);
-                }
+                if (cb.announce)
+                    cb.announce("No control point on this segment");
+                return true;
             }
-            else if (cb.showTypein)
-            {
-                cb.showTypein(index, controlPointIs2D(index) ? kTypein2DChooser : kTypeinCPValue);
-            }
+
+            if (cb.showTypein)
+                cb.showTypein(seg, controlPointIs2D(seg) ? kTypein2DChooser : kTypeinCPValue);
             return true;
         }
 
-        enterManipulate();
+        if (index >= N)
+        {
+            if (ms->endpointMode == MSEGStorage::EndpointMode::LOCKED)
+            {
+                if (cb.announce)
+                    cb.announce("Editing start node value, linked endpoints");
+                if (cb.showTypein)
+                    cb.showTypein(0, kTypeinValue);
+            }
+            else if (cb.announce)
+            {
+                cb.announce("No type-in for the final node, use arrow keys");
+            }
+        }
+        else if (cb.showTypein)
+        {
+            cb.showTypein(index, kTypeinValue);
+        }
         return true;
     }
 
     if (kc == juce::KeyPress::deleteKey || kc == juce::KeyPress::backspaceKey)
     {
-        deleteNode(mods.isShiftDown());
+        if (hasSelection())
+            groupDelete(mods.isShiftDown());
+        else
+            deleteNode(mods.isShiftDown());
         return true;
     }
 
@@ -1034,8 +1120,20 @@ bool MSEGAccessibleKeyboardHandler::processCursorKey(const juce::KeyPress &key)
         return true;
     }
 
+    if (mods.isCommandDown() && !mods.isAltDown() && lowerChar(key) == 'a')
+    {
+        selectAll();
+        return true;
+    }
+
     if (c == 'a')
     {
+        if (hasSelection())
+        {
+            if (cb.announce)
+                cb.announce("Clear the selection first to add a node");
+            return true;
+        }
         addNode(mods.isShiftDown());
         return true;
     }
@@ -1061,67 +1159,22 @@ bool MSEGAccessibleKeyboardHandler::processCursorKey(const juce::KeyPress &key)
     return false;
 }
 
-bool MSEGAccessibleKeyboardHandler::processManipulateKey(const juce::KeyPress &key)
-{
-    auto mods = key.getModifiers();
-    auto kc = key.getKeyCode();
-
-    if (kc == juce::KeyPress::returnKey || kc == juce::KeyPress::escapeKey)
-    {
-        exitManipulate(true);
-        return true;
-    }
-
-    if (kc == juce::KeyPress::leftKey || kc == juce::KeyPress::rightKey)
-    {
-        auto dx = (kc == juce::KeyPress::rightKey ? 1.f : -1.f) * xStep(mods);
-
-        if (part == Part::NODE)
-            nudgeNodeX(index, dx, xSnapFor(mods), true);
-        else
-            nudgeControlPoint(index, dx, 0.f);
-
-        return true;
-    }
-
-    if (kc == juce::KeyPress::upKey || kc == juce::KeyPress::downKey)
-    {
-        auto dy = (kc == juce::KeyPress::upKey ? 1.f : -1.f) * yStep(mods);
-
-        if (part == Part::NODE)
-            nudgeNodeY(index, dy, ySnapFor(mods), true);
-        else
-            nudgeControlPoint(index, 0.f, dy);
-
-        return true;
-    }
-
-    return false;
-}
-
 bool MSEGAccessibleKeyboardHandler::processSelectionKey(const juce::KeyPress &key)
 {
     auto mods = key.getModifiers();
     auto kc = key.getKeyCode();
-    auto c = lowerChar(key);
     auto N = selectableNodeCount();
 
-    if (kc == juce::KeyPress::escapeKey)
+    if (kc == juce::KeyPress::returnKey || kc == juce::KeyPress::escapeKey ||
+        altLetter(key) == 's')
     {
-        exitSelection(true);
-        return true;
-    }
-
-    if (kc == juce::KeyPress::returnKey)
-    {
-        enterGroup();
+        exitSelection();
         return true;
     }
 
     if (kc == juce::KeyPress::leftKey || kc == juce::KeyPress::rightKey)
     {
-        auto dir = kc == juce::KeyPress::rightKey ? 1 : -1;
-        auto target = index + dir;
+        auto target = index + (kc == juce::KeyPress::rightKey ? 1 : -1);
 
         if (target < 0 || target >= N)
         {
@@ -1130,118 +1183,36 @@ bool MSEGAccessibleKeyboardHandler::processSelectionKey(const juce::KeyPress &ke
             return true;
         }
 
+        // the cursor is the active end of the range; moving away from the
+        // anchor grows the selection, moving back toward it shrinks it
+        bool growing = std::abs(target - selectionAnchor) > std::abs(index - selectionAnchor);
+        auto unselected = index;
+
         placeCursorOnNode(target);
+        applyAnchorRange();
 
-        if (mods.isCommandDown())
-        {
-            // move the cursor without altering the selection
-            announceCursor();
-        }
-        else if (mods.isShiftDown())
-        {
-            auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
-            if (std::find(sel.begin(), sel.end(), target) == sel.end())
-                sel.push_back(target);
-            if (cb.setSelection)
-                cb.setSelection(sel);
-            if (cb.announce)
-                cb.announce(fmt::format("Node {}, {} nodes selected", target + 1, sel.size()));
-        }
-        else
-        {
-            if (cb.setSelection)
-                cb.setSelection({target});
-            if (cb.announce)
-                cb.announce(fmt::format("{}. 1 node selected", nodeAnnouncement(target)));
-        }
-
-        return true;
-    }
-
-    if (c == 'm')
-    {
-        auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
-        auto it = std::find(sel.begin(), sel.end(), index);
-        bool nowSelected = it == sel.end();
-
-        if (nowSelected)
-            sel.push_back(index);
-        else
-            sel.erase(it);
-
-        if (cb.setSelection)
-            cb.setSelection(sel);
         if (cb.announce)
-            cb.announce(fmt::format("{}, {} nodes selected",
-                                    nowSelected ? "Selected" : "Unselected", sel.size()));
+        {
+            auto nSel = std::abs(index - selectionAnchor) + 1;
+            if (growing)
+                cb.announce(
+                    fmt::format("Node {} selected, {} nodes selected", index + 1, nSel));
+            else
+                cb.announce(
+                    fmt::format("Node {} unselected, {} nodes selected", unselected + 1, nSel));
+        }
         return true;
     }
 
-    if (c == 'a')
+    if (mods.isCommandDown() && !mods.isAltDown() && lowerChar(key) == 'a')
     {
-        std::vector<int> all;
-        for (int i = 0; i < N; ++i)
-            all.push_back(i);
-        if (cb.setSelection)
-            cb.setSelection(all);
-        if (cb.announce)
-            cb.announce(fmt::format("All nodes selected, {} nodes", N));
+        selectAll();
         return true;
     }
 
-    if (c == 'n')
-    {
-        if (cb.setSelection)
-            cb.setSelection({});
-        if (cb.announce)
-            cb.announce("Selection cleared");
+    // consume Tab so focus traversal can't fire mid-selection
+    if (kc == juce::KeyPress::tabKey)
         return true;
-    }
-
-    if (c == 's')
-    {
-        exitSelection(false);
-        return true;
-    }
-
-    if (c == 'i')
-    {
-        announceEditorState();
-        return true;
-    }
-
-    return false;
-}
-
-bool MSEGAccessibleKeyboardHandler::processGroupKey(const juce::KeyPress &key)
-{
-    auto mods = key.getModifiers();
-    auto kc = key.getKeyCode();
-    auto c = lowerChar(key);
-
-    if (kc == juce::KeyPress::returnKey || kc == juce::KeyPress::escapeKey || c == 's')
-    {
-        exitGroup(true);
-        return true;
-    }
-
-    if (kc == juce::KeyPress::leftKey || kc == juce::KeyPress::rightKey)
-    {
-        groupNudgeX((kc == juce::KeyPress::rightKey ? 1.f : -1.f) * xStep(mods), xSnapFor(mods));
-        return true;
-    }
-
-    if (kc == juce::KeyPress::upKey || kc == juce::KeyPress::downKey)
-    {
-        groupNudgeY((kc == juce::KeyPress::upKey ? 1.f : -1.f) * yStep(mods), ySnapFor(mods));
-        return true;
-    }
-
-    if (c == 'i')
-    {
-        announceEditorState();
-        return true;
-    }
 
     return false;
 }

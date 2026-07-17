@@ -39,26 +39,19 @@ namespace Overlays
 {
 
 /*
- * The keyboard model for the accessible MSEG editor. A cursor always sits on
- * either a node or a segment control point; keys move the cursor along the
- * MSEG and edit the storage through the same Surge::MSEG API the mouse uses.
- * The handler owns no UI; the hosting canvas wires it up through Callbacks and
- * forwards keyPressed to processKey when the Accessible MSEG Editor option is on.
+ * The keyboard model for the accessible MSEG editor. A cursor always sits on a
+ * node; Tab and Shift+Tab step it along the MSEG, the four arrow keys move the
+ * node in time and value, and Alt+arrows adjust the current segment's control
+ * point. Edits go through the same Surge::MSEG API the mouse uses. The handler
+ * owns no UI; the hosting canvas wires it up through Callbacks and forwards
+ * keyPressed to processKey whenever the canvas has keyboard focus.
  */
 struct MSEGAccessibleKeyboardHandler
 {
-    enum struct Part
-    {
-        NODE,
-        CONTROL_POINT
-    };
-
     enum struct Mode
     {
         CURSOR,
-        MANIPULATE,
-        SELECTION,
-        GROUP_MANIPULATE
+        SELECTION
     };
 
     struct Callbacks
@@ -66,7 +59,6 @@ struct MSEGAccessibleKeyboardHandler
         std::function<void(const std::string &)> announce;
         std::function<void()> prepareForUndo;
         std::function<void()> pushToUndo;
-        std::function<void()> pushToUndoIfDirty;
         // arg is the active segment for pan constraints, or -1
         std::function<void(int)> modelChanged;
         std::function<void(int)> openContextMenuForSegment;
@@ -87,11 +79,12 @@ struct MSEGAccessibleKeyboardHandler
     LFOStorage *lfodata{nullptr};
     Callbacks cb;
 
-    Part part{Part::NODE};
     int index{0};
-    float cursorY{0.f};
     float rememberedTime{0.f};
     Mode mode{Mode::CURSOR};
+    // the node selection mode started on; the selection is always the
+    // contiguous range between this and the cursor
+    int selectionAnchor{0};
 
     // set while the handler applies its own edit, so revalidateCursor calls
     // triggered by that edit's modelChanged don't double-announce
@@ -109,27 +102,22 @@ struct MSEGAccessibleKeyboardHandler
     float nodeValue(int i) const;
     bool controlPointUsable(int seg) const;
     bool controlPointIs2D(int seg) const;
-    float controlPointTime(int seg) const;
-    float controlPointValue(int seg) const;
     std::pair<float, float> cursorPosition() const;
     int segmentForCursor() const;
 
   private:
     bool processCursorKey(const juce::KeyPress &key);
-    bool processManipulateKey(const juce::KeyPress &key);
     bool processSelectionKey(const juce::KeyPress &key);
-    bool processGroupKey(const juce::KeyPress &key);
 
-    void enterManipulate();
-    void exitManipulate(bool announce);
     void enterSelection();
-    void exitSelection(bool clear);
-    void enterGroup();
-    void exitGroup(bool announce);
+    void exitSelection();
+    void applyAnchorRange();
+    void clearSelection();
+    void selectAll();
+    bool hasSelection() const;
 
-    void moveCursor(int direction, bool skipControlPoints);
+    void moveCursor(int direction);
     void placeCursorOnNode(int node);
-    void placeCursorOnControlPoint(int seg);
 
     void addNode(bool append);
     void deleteNode(bool removeSegment);
@@ -137,8 +125,11 @@ struct MSEGAccessibleKeyboardHandler
     void nudgeNodeX(int node, float dx, float snap, bool announceResult);
     void nudgeNodeY(int node, float dy, float snapRes, bool announceResult);
     void nudgeControlPoint(int seg, float dx, float dy);
-    void groupNudgeX(float dx, float snap);
-    void groupNudgeY(float dy, float snapRes);
+    // return whether anything actually moved, so the caller can push undo
+    bool groupNudgeX(float dx, float snap);
+    bool groupNudgeY(float dy, float snapRes);
+    bool groupNudgeCP(float dx, float dy);
+    void groupDelete(bool removeSegment);
 
     float xStep(const juce::ModifierKeys &mods) const;
     float yStep(const juce::ModifierKeys &mods) const;
@@ -146,6 +137,8 @@ struct MSEGAccessibleKeyboardHandler
     // 0 (no quantize) for fine Shift moves so the fine step isn't rounded away
     float xSnapFor(const juce::ModifierKeys &mods) const;
     float ySnapFor(const juce::ModifierKeys &mods) const;
+
+    float curveValueAt(float t) const;
 
     void announceCursor();
     std::string nodeAnnouncement(int i) const;

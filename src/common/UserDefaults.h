@@ -88,7 +88,6 @@ enum DefaultKey
     MenuAndEditKeybindingsFollowKeyboardFocus,
     UseNarratorAnnouncements,
     UseNarratorAnnouncementsForPatchTypeahead,
-    UseAccessibleMSEGEditor,
     ExpandModMenusWithSubMenus,
     FocusModEditorAfterAddModulationFrom,
     NeverMoveKeyboardFocus,

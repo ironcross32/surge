@@ -37,6 +37,7 @@
 #include "widgets/NumberField.h"
 #include "widgets/Switch.h"
 #include "overlays/TypeinParamEditor.h"
+#include "overlays/OverlayWrapper.h"
 #include <algorithm>
 #include <set>
 #include "widgets/MenuCustomComponents.h"
@@ -154,7 +155,7 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
         setTitle("MSEG Display and Edit Canvas");
         setDescription("MSEG Display and Edit Canvas");
         setAccessible(true);
-        refreshAccessibilityState();
+        setupAccessibleKeyboard();
     };
 
     enum SegmentProps
@@ -1713,7 +1714,7 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
 
     void paintKeyboardCursor(juce::Graphics &g)
     {
-        if (!kbdHandler || !hasKeyboardFocus(false))
+        if (!hasKeyboardFocus(false))
             return;
 
         const float handleRadius = 6.5f; // matches recalcHotZones
@@ -1726,10 +1727,6 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
         g.setColour(skin->getColor(Colors::MSEGEditor::CurveHighlight));
         g.drawEllipse(cx - handleRadius - 2, cy - handleRadius - 2, 2 * (handleRadius + 2),
                       2 * (handleRadius + 2), 2.f);
-
-        // the free Y cursor, where A / Shift+A will place a new node
-        auto yy = valpx(kbdHandler->cursorY);
-        g.drawLine(cx - handleRadius - 6, yy, cx + handleRadius + 6, yy, 1.f);
     }
 
     juce::Point<int> mouseDownOrigin, lastPanZoomMousePos, cursorHideOrigin;
@@ -3105,40 +3102,73 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
 
         if (ms->editMode != MSEGStorage::LFO && ms->loopMode != MSEGStorage::LoopMode::ONESHOT)
         {
-            if (tts <= ms->loop_end + 1 && tts != ms->loop_start)
+            if (keyboardMenuNode >= 0)
             {
-                contextMenu.addItem(Surge::GUI::toOSCase("Set Loop Start"), [this, tts]() {
-                    Surge::MSEG::setLoopStart(ms, tts);
-                    pushToUndo();
-                    modelChanged();
-                });
+                // the accessible keyboard cursor sits on a node, so the intent
+                // is exact: the loop starts or ends at this node
+                auto node = keyboardMenuNode;
+
+                if (node < ms->n_activeSegments && node != ms->loop_start)
+                {
+                    contextMenu.addItem(Surge::GUI::toOSCase("Set Loop Start"), [this, node]() {
+                        Surge::MSEG::setLoopStart(ms, node);
+                        pushToUndo();
+                        modelChanged();
+                        if (sge)
+                            sge->enqueueImmediateAccessibleAnnouncement(
+                                fmt::format("Loop starts at node {}", node + 1));
+                    });
+                }
+
+                if (node > 0 && node - 1 != ms->loop_end)
+                {
+                    contextMenu.addItem(Surge::GUI::toOSCase("Set Loop End"), [this, node]() {
+                        Surge::MSEG::setLoopEnd(ms, node - 1);
+                        pushToUndo();
+                        modelChanged();
+                        if (sge)
+                            sge->enqueueImmediateAccessibleAnnouncement(
+                                fmt::format("Loop ends at node {}", node + 1));
+                    });
+                }
             }
-
-            if (tts >= ms->loop_start - 1 && tts != ms->loop_end)
+            else
             {
-                contextMenu.addItem(Surge::GUI::toOSCase("Set Loop End"), [this, tts, t]() {
-                    auto along = t - ms->segmentStart[tts];
+                if (tts <= ms->loop_end + 1 && tts != ms->loop_start)
+                {
+                    contextMenu.addItem(Surge::GUI::toOSCase("Set Loop Start"), [this, tts]() {
+                        Surge::MSEG::setLoopStart(ms, tts);
+                        pushToUndo();
+                        modelChanged();
+                    });
+                }
 
-                    if (ms->segments[tts].duration == 0)
-                    {
-                        along = 0;
-                    }
-                    else
-                    {
-                        along = along / ms->segments[tts].duration;
-                    }
+                if (tts >= ms->loop_start - 1 && tts != ms->loop_end)
+                {
+                    contextMenu.addItem(Surge::GUI::toOSCase("Set Loop End"), [this, tts, t]() {
+                        auto along = t - ms->segmentStart[tts];
 
-                    int target = tts;
+                        if (ms->segments[tts].duration == 0)
+                        {
+                            along = 0;
+                        }
+                        else
+                        {
+                            along = along / ms->segments[tts].duration;
+                        }
 
-                    if (along < 0.1 && tts > 0)
-                    {
-                        target = tts - 1;
-                    }
+                        int target = tts;
 
-                    Surge::MSEG::setLoopEnd(ms, target);
-                    pushToUndo();
-                    modelChanged();
-                });
+                        if (along < 0.1 && tts > 0)
+                        {
+                            target = tts - 1;
+                        }
+
+                        Surge::MSEG::setLoopEnd(ms, target);
+                        pushToUndo();
+                        modelChanged();
+                    });
+                }
             }
 
             contextMenu.addSeparator();
@@ -3448,10 +3478,7 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
         this->sge->forceLfoDisplayRepaint();
         onModelChanged();
 
-        if (kbdHandler)
-        {
-            kbdHandler->revalidateCursor(!kbdHandler->inFlightEdit);
-        }
+        kbdHandler->revalidateCursor(!kbdHandler->inFlightEdit);
 
         repaint();
     }
@@ -3588,34 +3615,20 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
     }
 
     /*
-     * The accessible keyboard model: when the Accessible MSEG Editor option is on,
-     * the canvas takes keyboard focus and forwards keys to a handler which edits
-     * the storage through the same Surge::MSEG API the mouse uses.
+     * The accessible keyboard model: the canvas takes keyboard focus and forwards
+     * keys to a handler which edits the storage through the same Surge::MSEG API
+     * the mouse uses.
      */
     std::unique_ptr<MSEGAccessibleKeyboardHandler> kbdHandler;
 
-    bool accessibleKeyboardMode() const
+    // >= 0 while openPopup runs for the accessible keyboard cursor: the node
+    // the menu was invoked on, so position-inferred items (the loop points)
+    // can act on the exact node instead of guessing from pixel coordinates
+    int keyboardMenuNode{-1};
+
+    void setupAccessibleKeyboard()
     {
-        return storage && Surge::Storage::getUserDefaultValue(
-                              storage, Surge::Storage::UseAccessibleMSEGEditor, false);
-    }
-
-    void refreshAccessibilityState()
-    {
-        auto en = accessibleKeyboardMode();
-
-        setWantsKeyboardFocus(en);
-
-        if (!en)
-        {
-            kbdHandler.reset();
-            return;
-        }
-
-        if (kbdHandler)
-        {
-            return;
-        }
+        setWantsKeyboardFocus(true);
 
         kbdHandler = std::make_unique<MSEGAccessibleKeyboardHandler>();
         kbdHandler->storage = storage;
@@ -3630,12 +3643,15 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
         };
         cbk.prepareForUndo = [this]() { prepareForUndo(); };
         cbk.pushToUndo = [this]() { pushToUndo(); };
-        cbk.pushToUndoIfDirty = [this]() { pushToUndoIfDirty(); };
         cbk.modelChanged = [this](int seg) { modelChanged(seg, false); };
         cbk.openContextMenuForSegment = [this](int seg) {
             hoveredSegment = seg;
+            keyboardMenuNode = kbdHandler->index;
+            // the mouse path snapshots undo state on mouseDown before the popup
+            prepareForUndo();
             auto pos = kbdHandler->cursorPosition();
             openPopup(juce::Point<float>(timeToPx()(pos.first), valToPx()(pos.second)));
+            keyboardMenuNode = -1;
         };
         cbk.showTypein = [this](int seg, int prop) {
             auto pos = kbdHandler->cursorPosition();
@@ -3687,7 +3703,7 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
 
     bool keyPressed(const juce::KeyPress &key) override
     {
-        if (kbdHandler && hasKeyboardFocus(false))
+        if (hasKeyboardFocus(false))
         {
             return kbdHandler->processKey(key);
         }
@@ -3696,21 +3712,15 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
 
     void focusGained(juce::Component::FocusChangeType cause) override
     {
-        if (kbdHandler)
-        {
-            kbdHandler->revalidateCursor(false);
-            kbdHandler->announceFocus();
-            repaint();
-        }
+        kbdHandler->revalidateCursor(false);
+        kbdHandler->announceFocus();
+        repaint();
     }
 
     void focusLost(juce::Component::FocusChangeType cause) override
     {
-        if (kbdHandler)
-        {
-            kbdHandler->cancelModes();
-            repaint();
-        }
+        kbdHandler->cancelModes();
+        repaint();
     }
 
     std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
@@ -3719,13 +3729,13 @@ struct MSEGCanvas : public juce::Component, public Surge::GUI::SkinConsumingComp
             *this, juce::AccessibilityRole::group,
             juce::AccessibilityActions().addAction(
                 juce::AccessibilityActionType::showMenu, [this]() {
-                    if (kbdHandler)
-                    {
-                        auto seg = kbdHandler->segmentForCursor();
-                        hoveredSegment = seg;
-                        auto pos = kbdHandler->cursorPosition();
-                        openPopup(juce::Point<float>(timeToPx()(pos.first), valToPx()(pos.second)));
-                    }
+                    auto seg = kbdHandler->segmentForCursor();
+                    hoveredSegment = seg;
+                    keyboardMenuNode = kbdHandler->index;
+                    prepareForUndo();
+                    auto pos = kbdHandler->cursorPosition();
+                    openPopup(juce::Point<float>(timeToPx()(pos.first), valToPx()(pos.second)));
+                    keyboardMenuNode = -1;
                 }));
     }
 };
@@ -4338,6 +4348,8 @@ MSEGEditor::MSEGEditor(SurgeStorage *storage, LFOStorage *lfodata, MSEGStorage *
                        SurgeGUIEditor *sge)
     : OverlayComponent("MSEG Editor")
 {
+    this->sge = sge;
+
     // Leave these in for now
     if (ms->n_activeSegments <= 0) // This is an error state! Compensate
     {
@@ -4367,13 +4379,17 @@ void MSEGEditor::forceRefresh()
         auto ed = dynamic_cast<MSEGCanvas *>(kid);
         if (ed)
         {
-            ed->refreshAccessibilityState();
             ed->modelChanged();
         }
         auto cr = dynamic_cast<MSEGControlRegion *>(kid);
         if (cr)
             cr->rebuild();
     }
+}
+
+std::vector<juce::Component *> MSEGEditor::getGroupNavigationComponents()
+{
+    return {canvas.get(), controls.get()};
 }
 
 void MSEGEditor::paint(juce::Graphics &g) { g.fillAll(juce::Colours::black); }
