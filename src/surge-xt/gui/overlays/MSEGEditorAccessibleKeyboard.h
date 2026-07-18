@@ -124,11 +124,11 @@ struct MSEGAccessibleKeyboardHandler
     void resetCP();
     void nudgeNodeX(int node, float dx, float snap, bool announceResult);
     void nudgeNodeY(int node, float dy, float snapRes, bool announceResult);
-    void nudgeControlPoint(int seg, float dx, float dy);
+    void nudgeControlPoint(int seg, float dx, float dy, float ySnapRes);
     // return whether anything actually moved, so the caller can push undo
     bool groupNudgeX(float dx, float snap);
     bool groupNudgeY(float dy, float snapRes);
-    bool groupNudgeCP(float dx, float dy);
+    bool groupNudgeCP(float dx, float dy, float ySnapRes);
     void groupDelete(bool removeSegment);
 
     float xStep(const juce::ModifierKeys &mods) const;
