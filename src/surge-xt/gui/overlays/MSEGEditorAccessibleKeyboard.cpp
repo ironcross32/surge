@@ -168,14 +168,14 @@ float MSEGAccessibleKeyboardHandler::unipolarFactor() const
 
 float MSEGAccessibleKeyboardHandler::xStep(const juce::ModifierKeys &mods) const
 {
-    float b = ms->hSnap > 0 ? ms->hSnap : ms->hSnapDefault;
-    if (b <= 0)
-        b = 0.05f;
-    if (mods.isShiftDown())
-        b *= 0.25f;
     if (mods.isCommandDown())
-        b *= 4.f;
-    return b;
+    {
+        float b = ms->hSnap > 0 ? ms->hSnap : ms->hSnapDefault;
+        if (b <= 0)
+            b = 0.05f;
+        return b;
+    }
+    return mods.isShiftDown() ? 0.01f : 0.05f;
 }
 
 float MSEGAccessibleKeyboardHandler::yStep(const juce::ModifierKeys &mods) const
@@ -192,9 +192,14 @@ float MSEGAccessibleKeyboardHandler::yStep(const juce::ModifierKeys &mods) const
     return mods.isShiftDown() ? 0.01f : 0.05f;
 }
 
+// time moves only quantize with Ctrl held, which engages the horizontal snap
+// division whether or not the snap checkbox is on
 float MSEGAccessibleKeyboardHandler::xSnapFor(const juce::ModifierKeys &mods) const
 {
-    return mods.isShiftDown() ? 0.f : ms->hSnap;
+    if (!mods.isCommandDown())
+        return 0.f;
+    float b = ms->hSnap > 0 ? ms->hSnap : ms->hSnapDefault;
+    return std::max(b, 0.f);
 }
 
 // value moves only quantize with Ctrl held, which engages the vertical snap
@@ -358,9 +363,20 @@ void MSEGAccessibleKeyboardHandler::nudgeNodeY(int node, float dy, float snapRes
     }
 }
 
+// adjustDurationInternal snaps relative to dragDuration, a mouse-drag
+// accumulator the mouse path stashes on mouseDown; refresh it so keyboard
+// snap moves are relative to the node's actual time
+void MSEGAccessibleKeyboardHandler::refreshSnapDragState()
+{
+    for (int i = 0; i < ms->n_activeSegments; ++i)
+        ms->segments[i].dragDuration = ms->segments[i].duration;
+}
+
 void MSEGAccessibleKeyboardHandler::nudgeNodeX(int node, float dx, float snap, bool announceResult)
 {
     auto N = ms->n_activeSegments;
+
+    refreshSnapDragState();
 
     if (node <= 0)
     {
@@ -701,6 +717,8 @@ bool MSEGAccessibleKeyboardHandler::groupNudgeX(float dx, float snap)
 {
     auto sel = cb.getSelection ? cb.getSelection() : std::vector<int>();
     auto N = ms->n_activeSegments;
+
+    refreshSnapDragState();
 
     std::sort(sel.begin(), sel.end());
     if (dx > 0)
